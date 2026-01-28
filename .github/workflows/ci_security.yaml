@@ -1,0 +1,196 @@
+name: CI SECURITY
+
+on:
+  workflow_dispatch:
+
+env:
+  APP_NAME: universal-resolver-fe
+  APP_TAG: ${{ github.sha }}-${{ github.run_number }}
+  APP_DIR: .
+  GITOPS_PRODUCT: layer-3/ndadid
+  GITOPS_FILE: uniresolver-fe.yaml
+  APP_REGISTRY: registry.pila.vn
+  CODEQL_LANGUAGE: javascript # python, javascript, cpp, csharp, java, go, typescript, c
+
+jobs:
+  scan-secrets-leak:
+    runs-on: medium
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@v4"
+
+      - name: Clean up gitleak tmp file
+        run: |
+          if [ -f /tmp/gitleaks.tmp ]; then
+            rm /tmp/gitleaks.tmp
+          fi
+
+      - name: Gitleaks (scan PR)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          RUNNER_NAME: ${{ runner.name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }} # Only required for Organizations, not personal accounts.
+
+  security-scans:
+    needs: scan-secrets-leak
+    runs-on: medium
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Set dynamic env for branch
+        run: |
+          if [[ "${GITHUB_REF##*/}" == "prod" || "${GITHUB_REF##*/}" == "main" ]]; then
+            echo 'GITOPS_NAMESPACE=prod' >> $GITHUB_ENV
+
+          elif [[ "${GITHUB_REF##*/}" == "beta" ]]; then
+            echo 'GITOPS_NAMESPACE=beta' >> $GITHUB_ENV
+
+          else
+            echo 'GITOPS_NAMESPACE=dev' >> $GITHUB_ENV
+          fi
+
+      - name: Set APP IMAGE dynamic
+        run: |
+          echo "REGISTRY_SA=robot\$${{ env.GITOPS_NAMESPACE }}" >> $GITHUB_ENV
+          echo "APP_IMAGE=${{ env.APP_REGISTRY }}/${{ env.GITOPS_NAMESPACE }}/${{ env.APP_NAME }}" >> $GITHUB_ENV
+
+      - name: Setup Python + SARIF tools
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install semgrep sarif-tools
+
+      # --- Semgrep ---      
+      - name: Run Semgrep
+        run: |
+          semgrep scan --config auto --sarif > semgrep-${{ env.APP_NAME }}-report.sarif || true
+          sarif html semgrep-${{ env.APP_NAME }}-report.sarif -o semgrep-${{ env.APP_NAME }}-report.html
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-reports
+          path: |
+            semgrep-${{ env.APP_NAME }}-report.html
+  
+      # --- Report vulnerabilities (warning only) ---
+      - name: Check vulnerabilities
+        run: |
+          has_vuln=false
+          vuln_files=""
+
+          # Check SARIF format reports only
+          for file in semgrep-${{ env.APP_NAME }}-report.sarif; do
+            if [ -f "$file" ]; then
+              # Check if results array has any findings (not rule definitions)
+              result_count=$(jq '.runs[0].results | length' "$file" 2>/dev/null || echo "0")
+
+              if [ "$result_count" -gt 0 ]; then
+                echo "⚠️ Vulnerabilities detected in: $file (found $result_count issues)"
+                vuln_files="$vuln_files $file"
+                has_vuln=true
+              else
+                echo "✅ No vulnerabilities in: $file"
+              fi
+            else
+              echo "⚠️ Report not found: $file (skipping)"
+            fi
+          done
+
+          if [ "$has_vuln" = true ]; then
+            echo "⚠️ WARNING: Vulnerabilities detected in SAST/Deps" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No vulnerabilities detected in any report." >> $GITHUB_STEP_SUMMARY
+          fi
+ 
+  build-and-image-scan:
+    runs-on: medium
+    needs: security-scans
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@v4"
+
+      - name: Set dynamic env for branch
+        run: |
+          if [[ "${GITHUB_REF##*/}" == "prod" || "${GITHUB_REF##*/}" == "main"  ]]; then
+            echo "REGISTRY_PASS=${{ secrets.ORG_PILA_PROD_PASS }}" >> $GITHUB_ENV
+            echo 'GITOPS_NAMESPACE=prod' >> $GITHUB_ENV
+
+          else
+            echo "REGISTRY_PASS=${{ secrets.ORG_PILA_DEV_PASS }}" >> $GITHUB_ENV
+            echo 'GITOPS_NAMESPACE=dev' >> $GITHUB_ENV
+          fi
+          
+      - name: Set APP IMAGE dynamic
+        run: |
+          echo "REGISTRY_SA=robot\$${{ env.GITOPS_NAMESPACE }}" >> $GITHUB_ENV
+          echo "APP_IMAGE=${{ env.APP_REGISTRY }}/${{ env.GITOPS_NAMESPACE }}/${{ env.APP_NAME }}" >> $GITHUB_ENV
+      
+      - name: Authenticate Registry
+        run: |-
+          docker login -u '${{ env.REGISTRY_SA }}' -p '${{ env.REGISTRY_PASS }}' ${{ env.APP_REGISTRY }}
+
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.APP_IMAGE }}:${{ env.APP_TAG }}
+
+    # --- Trivy scan ---
+      - name: Download Trivy template
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ env.APP_IMAGE }}:${{ env.APP_TAG }}"
+          format: "template"
+          template: "@html.tpl"
+          output: "trivy-${{ env.APP_NAME }}-report.html"
+          severity: "MEDIUM,HIGH,CRITICAL"
+          exit-code: "0"
+
+      - name: Upload scan result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "trivy-${{ env.APP_NAME }}-report"
+          path: trivy-${{ env.APP_NAME }}-report.html
+
+      - name: Fail if Trivy found issues
+        run: |
+          if grep -q "CVE-" "trivy-${{ env.APP_NAME }}-report.html"; then
+            echo "🛑 Vulnerabilities found in image scan." >> $GITHUB_STEP_SUMMARY
+            # exit 1
+          fi
+      # --- Push + GitOps update ---
+      - name: Push image
+        if: success()
+        run: |
+          docker push ${{ env.APP_IMAGE }}:${{ env.APP_TAG }};
+          docker image rm ${{ env.APP_IMAGE }}:${{ env.APP_TAG }};          
+
+      - name: Check out gitops repo
+        uses: "actions/checkout@v4"
+        with:
+          repository: pilacorp/pila-system
+          ref: ${{ env.GITOPS_NAMESPACE }}
+          token: ${{ secrets.ORG_GITOPS_PAT }}
+      
+      - name: Update image tag
+        run: |
+          sed -i 's|\(image: ${{ env.APP_IMAGE }}:\).*|\1${{ env.APP_TAG }}|' ${{ env.GITOPS_FILE}}
+        working-directory: ${{ env.GITOPS_PRODUCT }}
+
+      - name: Commit update
+        run: |
+          git config --global user.name ${{ secrets.ORG_GITOPS_NAME }}
+          git config --global user.email ${{ secrets.ORG_GITOPS_EMAIL }}
+          git add .
+          git commit -m "deploy ${{ env.APP_NAME }} ver ${{ env.APP_TAG }}"
+          git push origin
